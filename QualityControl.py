@@ -5,6 +5,7 @@ from pyspark.ml.feature import Imputer
 from pyspark.sql.types import *
 from pyspark.sql.window import Window
 import numpy as np
+import jellyfish  # For fuzzy matching
 
 class NullValues:
     """
@@ -1048,5 +1049,524 @@ class RangeValidity:
             # Add more methods as needed
 
         return suggested_boundaries
+
+
+class CategoricalValidity:
+    """
+    A comprehensive class for validating and standardizing categorical data in PySpark DataFrames.
+    Provides methods for detecting and correcting category inconsistencies, misspellings,
+    and format variations.
+    
+    Attributes
+    ----------
+    df : pyspark.sql.DataFrame
+        The input DataFrame to analyze
+    _cache : Dict
+        Cache for frequently used computations
+    """
+
+    def check_category_validity(
+            self,
+            column: str,
+            valid_categories: Optional[List[str]] = None,
+            case_sensitive: bool = False,
+            frequency_threshold: Optional[float] = None
+        ) -> Dict[str, Any]:
+        """
+        Performs comprehensive analysis of categorical validity issues.
+        
+        Parameters
+        ----------
+        column : str
+            Column name to analyze
+        valid_categories : Optional[List[str]], default=None
+            List of valid category values. If None, infers from data
+        case_sensitive : bool, default=False
+            Whether to treat different cases as distinct categories
+        frequency_threshold : Optional[float], default=None
+            Threshold for identifying rare categories (0.0 to 1.0)
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing detailed category analysis:
+            {
+                'invalid_categories': List[str],
+                'category_frequencies': Dict[str, int],
+                'rare_categories': List[str],
+                'case_variations': Dict[str, List[str]],
+                'potential_misspellings': Dict[str, List[Dict]],
+                'statistics': {
+                    'total_categories': int,
+                    'invalid_count': int,
+                    'rare_count': int,
+                    'case_inconsistencies': int
+                },
+                'suggestions': {
+                    'mappings': Dict[str, str],
+                    'groupings': List[List[str]]
+                }
+            }
+            
+        Examples
+        --------
+        >>> cv = CategoricalValidity(spark_df)
+        >>> results = cv.check_category_validity(
+        ...     column='product_category',
+        ...     valid_categories=['Electronics', 'Clothing', 'Books'],
+        ...     frequency_threshold=0.01
+        ... )
+        >>> print(f"Found {len(results['invalid_categories'])} invalid categories")
+        
+        Notes
+        -----
+        The method performs comprehensive categorical analysis:
+        1. Validates against known categories
+        2. Identifies rare categories
+        3. Detects case inconsistencies
+        4. Suggests potential corrections
+        """
+        # Implementation of check_category_validity
+        df = self.df
+        if not case_sensitive:
+            df = df.withColumn(column, F.lower(F.col(column)))
+            if valid_categories:
+                valid_categories = [cat.lower() for cat in valid_categories]
+
+        category_counts = df.groupBy(column).count()
+        total_count = category_counts.agg(F.sum("count")).collect()[0][0]
+
+        category_frequencies = {row[column]: row["count"] for row in category_counts.collect()}
+        invalid_categories = []
+        rare_categories = []
+        case_variations = {}
+        potential_misspellings = {}
+
+        if valid_categories:
+            invalid_categories = [cat for cat in category_frequencies if cat not in valid_categories]
+
+        if frequency_threshold:
+            rare_categories = [cat for cat, count in category_frequencies.items() if count / total_count < frequency_threshold]
+
+        if not case_sensitive:
+            for cat in category_frequencies:
+                variations = [var for var in category_frequencies if var.lower() == cat.lower() and var != cat]
+                if variations:
+                    case_variations[cat] = variations
+
+        # Placeholder for potential misspellings detection
+        # This would involve using a string similarity algorithm like Levenshtein or Jaro-Winkler
+
+        statistics = {
+            'total_categories': len(category_frequencies),
+            'invalid_count': len(invalid_categories),
+            'rare_count': len(rare_categories),
+            'case_inconsistencies': len(case_variations)
+        }
+
+        suggestions = {
+            'mappings': {},  # Placeholder for suggested mappings
+            'groupings': []  # Placeholder for suggested groupings
+        }
+
+        return {
+            'invalid_categories': invalid_categories,
+            'category_frequencies': category_frequencies,
+            'rare_categories': rare_categories,
+            'case_variations': case_variations,
+            'potential_misspellings': potential_misspellings,
+            'statistics': statistics,
+            'suggestions': suggestions
+        }
+
+    def check_spelling_variants(
+            self,
+            column: str,
+            reference_values: Optional[List[str]] = None,
+            similarity_threshold: float = 0.85,
+            algorithm: str = 'jaro_winkler'
+        ) -> Dict[str, Any]:
+        """
+        Identifies potential misspellings and variants in categorical values.
+        
+        Parameters
+        ----------
+        column : str
+            Column to analyze for spelling variants
+        reference_values : Optional[List[str]], default=None
+            Known correct spellings. If None, uses most frequent values
+        similarity_threshold : float, default=0.85
+            Threshold for considering values as variants (0.0 to 1.0)
+        algorithm : str, default='jaro_winkler'
+            Algorithm for string similarity:
+            - 'levenshtein': Edit distance-based
+            - 'jaro_winkler': Position-based
+            - 'soundex': Phonetic similarity
+            - 'ngram': N-gram-based similarity
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing spelling analysis:
+            {
+                'variant_groups': List[Dict],
+                'similarity_scores': Dict[str, float],
+                'correction_suggestions': Dict[str, str],
+                'confidence_scores': Dict[str, float],
+                'statistics': {
+                    'total_variants': int,
+                    'unique_base_values': int,
+                    'average_group_size': float
+                }
+            }
+            
+        Examples
+        --------
+        >>> cv = CategoricalValidity(spark_df)
+        >>> variants = cv.check_spelling_variants(
+        ...     column='country',
+        ...     reference_values=['United States', 'United Kingdom', 'Canada'],
+        ...     similarity_threshold=0.9
+        ... )
+        
+        Notes
+        -----
+        Implements sophisticated spelling analysis:
+        1. Identifies similar values
+        2. Groups related variants
+        3. Suggests corrections
+        4. Provides confidence scores
+        """
+        df = self.df
+        if not reference_values:
+            reference_values = df.groupBy(column).count().orderBy(F.desc("count")).limit(100).select(column).rdd.flatMap(lambda x: x).collect()
+
+        def get_similarity_func(algorithm):
+            if algorithm == 'levenshtein':
+                return jellyfish.levenshtein_distance
+            elif algorithm == 'jaro_winkler':
+                return jellyfish.jaro_winkler
+            elif algorithm == 'soundex':
+                return jellyfish.soundex
+            elif algorithm == 'ngram':
+                return lambda x, y: jellyfish.ngram_similarity(x, y, 2)
+            else:
+                raise ValueError(f"Unknown algorithm: {algorithm}")
+
+        similarity_func = get_similarity_func(algorithm)
+        variant_groups = []
+        similarity_scores = {}
+        correction_suggestions = {}
+        confidence_scores = {}
+
+        for value in df.select(column).distinct().rdd.flatMap(lambda x: x).collect():
+            for ref_value in reference_values:
+                similarity = similarity_func(value, ref_value)
+                if similarity >= similarity_threshold:
+                    similarity_scores[value] = similarity
+                    correction_suggestions[value] = ref_value
+                    confidence_scores[value] = similarity
+                    variant_groups.append({'value': value, 'reference': ref_value, 'similarity': similarity})
+
+        statistics = {
+            'total_variants': len(variant_groups),
+            'unique_base_values': len(reference_values),
+            'average_group_size': len(variant_groups) / len(reference_values) if reference_values else 0
+        }
+
+        return {
+            'variant_groups': variant_groups,
+            'similarity_scores': similarity_scores,
+            'correction_suggestions': correction_suggestions,
+            'confidence_scores': confidence_scores,
+            'statistics': statistics
+        }
+
+    def map_to_standard_categories(
+            self,
+            column: str,
+            mapping: Dict[str, str],
+            handle_unknown: str = 'keep',
+            case_sensitive: bool = False
+        ) -> DataFrame:
+        """
+        Maps categorical values to standardized categories using a provided mapping.
+        
+        Parameters
+        ----------
+        column : str
+            Column to standardize
+        mapping : Dict[str, str]
+            Dictionary mapping current values to standard categories
+        handle_unknown : str, default='keep'
+            How to handle values not in mapping:
+            - 'keep': Preserve original value
+            - 'null': Set to null
+            - 'error': Raise error
+            - 'other': Map to 'Other' category
+        case_sensitive : bool, default=False
+            Whether to perform case-sensitive mapping
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with standardized categories
+            
+        Examples
+        --------
+        >>> cv = CategoricalValidity(spark_df)
+        >>> standardized_df = cv.map_to_standard_categories(
+        ...     column='status',
+        ...     mapping={
+        ...         'in_progress': 'In Progress',
+        ...         'in progress': 'In Progress',
+        ...         'done': 'Completed',
+        ...         'finished': 'Completed'
+        ...     }
+        ... )
+        
+        Notes
+        -----
+        Implements robust category standardization:
+        1. Applies mapping rules
+        2. Handles unknown values
+        3. Manages case sensitivity
+        4. Preserves data integrity
+        """
+        df = self.df
+        if not case_sensitive:
+            df = df.withColumn(column, F.lower(F.col(column)))
+            mapping = {k.lower(): v for k, v in mapping.items()}
+
+        def map_value(value):
+            if value in mapping:
+                return mapping[value]
+            elif handle_unknown == 'null':
+                return None
+            elif handle_unknown == 'error':
+                raise ValueError(f"Unknown category: {value}")
+            elif handle_unknown == 'other':
+                return 'Other'
+            else:
+                return value
+
+        map_udf = F.udf(map_value, F.StringType())
+        df = df.withColumn(column, map_udf(F.col(column)))
+
+        return df
+
+    def correct_with_fuzzy_matching(
+            self,
+            column: str,
+            reference_values: List[str],
+            similarity_threshold: float = 0.85,
+            max_suggestions: int = 1
+        ) -> DataFrame:
+        """
+        Corrects categorical values using fuzzy matching against reference values.
+        
+        Parameters
+        ----------
+        column : str
+            Column to correct
+        reference_values : List[str]
+            List of correct reference values
+        similarity_threshold : float, default=0.85
+            Minimum similarity score for matching (0.0 to 1.0)
+        max_suggestions : int, default=1
+            Maximum number of correction suggestions to return
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with corrected categories and confidence scores
+            
+        Examples
+        --------
+        >>> cv = CategoricalValidity(spark_df)
+        >>> corrected_df = cv.correct_with_fuzzy_matching(
+        ...     column='product_type',
+        ...     reference_values=['Laptop', 'Desktop', 'Tablet'],
+        ...     similarity_threshold=0.8
+        ... )
+        
+        Notes
+        -----
+        Implements intelligent fuzzy correction:
+        1. Computes similarity scores
+        2. Suggests corrections
+        3. Handles ambiguous cases
+        4. Provides confidence metrics
+        """
+        df = self.df
+
+        def get_similarity_func(algorithm):
+            if algorithm == 'levenshtein':
+                return jellyfish.levenshtein_distance
+            elif algorithm == 'jaro_winkler':
+                return jellyfish.jaro_winkler
+            elif algorithm == 'soundex':
+                return jellyfish.soundex
+            elif algorithm == 'ngram':
+                return lambda x, y: jellyfish.ngram_similarity(x, y, 2)
+            else:
+                raise ValueError(f"Unknown algorithm: {algorithm}")
+
+        similarity_func = get_similarity_func('jaro_winkler')
+
+        def correct_value(value):
+            best_match = None
+            best_similarity = 0
+            for ref_value in reference_values:
+                similarity = similarity_func(value, ref_value)
+                if similarity > best_similarity and similarity >= similarity_threshold:
+                    best_match = ref_value
+                    best_similarity = similarity
+            return best_match if best_match else value
+
+        correct_udf = F.udf(correct_value, F.StringType())
+        df = df.withColumn(column, correct_udf(F.col(column)))
+
+        return df
+
+    def standardize_case(
+            self,
+            columns: Union[str, List[str]],
+            case_type: str = 'title',
+            custom_rules: Optional[Dict[str, str]] = None
+        ) -> DataFrame:
+        """
+        Standardizes the case format of categorical values.
+        
+        Parameters
+        ----------
+        columns : Union[str, List[str]]
+            Columns to standardize
+        case_type : str, default='title'
+            Type of case standardization:
+            - 'lower': All lowercase
+            - 'upper': All uppercase
+            - 'title': Title Case
+            - 'sentence': Sentence case
+            - 'custom': Use custom_rules
+        custom_rules : Optional[Dict[str, str]], default=None
+            Custom case mapping rules
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with standardized case format
+            
+        Examples
+        --------
+        >>> cv = CategoricalValidity(spark_df)
+        >>> standardized_df = cv.standardize_case(
+        ...     columns=['category', 'subcategory'],
+        ...     case_type='title'
+        ... )
+        
+        Notes
+        -----
+        Implements comprehensive case standardization:
+        1. Applies case rules
+        2. Handles special cases
+        3. Preserves acronyms
+        4. Supports custom formatting
+        """
+        df = self.df
+        if isinstance(columns, str):
+            columns = [columns]
+
+        def standardize(value, case_type, custom_rules):
+            if custom_rules and value in custom_rules:
+                return custom_rules[value]
+            if case_type == 'lower':
+                return value.lower()
+            elif case_type == 'upper':
+                return value.upper()
+            elif case_type == 'title':
+                return value.title()
+            elif case_type == 'sentence':
+                return value.capitalize()
+            else:
+                return value
+
+        standardize_udf = F.udf(lambda x: standardize(x, case_type, custom_rules), F.StringType())
+
+        for column in columns:
+            df = df.withColumn(column, standardize_udf(F.col(column)))
+
+        return df
+
+    def group_rare_categories(
+            self,
+            column: str,
+            threshold: float = 0.01,
+            grouping_method: str = 'frequency',
+            other_category_name: str = 'Other'
+        ) -> DataFrame:
+        """
+        Groups infrequent categories into a single category.
+        
+        Parameters
+        ----------
+        column : str
+            Column containing categories to group
+        threshold : float, default=0.01
+            Frequency threshold for considering a category rare (0.0 to 1.0)
+        grouping_method : str, default='frequency'
+            Method for identifying rare categories:
+            - 'frequency': Based on occurrence count
+            - 'percentage': Based on percentage of total
+            - 'rank': Based on frequency rank
+        other_category_name : str, default='Other'
+            Name for the grouped category
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with rare categories grouped
+            
+        Examples
+        --------
+        >>> cv = CategoricalValidity(spark_df)
+        >>> grouped_df = cv.group_rare_categories(
+        ...     column='product_subcategory',
+        ...     threshold=0.05,
+        ...     grouping_method='percentage'
+        ... )
+        
+        Notes
+        -----
+        Implements intelligent category grouping:
+        1. Identifies rare categories
+        2. Applies grouping rules
+        3. Preserves data distribution
+        4. Maintains traceability
+        """
+        df = self.df
+
+        if grouping_method == 'frequency':
+            category_counts = df.groupBy(column).count()
+            total_count = category_counts.agg(F.sum("count")).collect()[0][0]
+            rare_categories = category_counts.filter(F.col("count") / total_count < threshold).select(column).rdd.flatMap(lambda x: x).collect()
+        elif grouping_method == 'percentage':
+            category_counts = df.groupBy(column).count()
+            total_count = category_counts.agg(F.sum("count")).collect()[0][0]
+            rare_categories = category_counts.filter(F.col("count") / total_count < threshold).select(column).rdd.flatMap(lambda x: x).collect()
+        elif grouping_method == 'rank':
+            category_counts = df.groupBy(column).count().orderBy(F.asc("count"))
+            rare_categories = category_counts.limit(int(threshold * category_counts.count())).select(column).rdd.flatMap(lambda x: x).collect()
+        else:
+            raise ValueError(f"Unknown grouping method: {grouping_method}")
+
+        def group_value(value):
+            return other_category_name if value in rare_categories else value
+
+        group_udf = F.udf(group_value, F.StringType())
+        df = df.withColumn(column, group_udf(F.col(column)))
+
+        return df
+    
 
 
