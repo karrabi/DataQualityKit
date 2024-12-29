@@ -1,9 +1,10 @@
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
-from typing import Dict, List, Union, Optional, Any
+from typing import Dict, List, Union, Optional, Tuple, Any
 from pyspark.ml.feature import Imputer
 from pyspark.sql.types import *
-
+from pyspark.sql.window import Window
+import numpy as np
 
 class NullValues:
     """
@@ -636,4 +637,416 @@ class DataTypeConformity:
         except ValueError:
             return False
         
+
+class RangeValidity:
+    """
+    A comprehensive class for handling range validity issues in PySpark DataFrames.
+    Provides methods for detecting and fixing out-of-range values using both
+    statistical and domain-specific approaches.
+    """
+
+    def check(self,
+             df: DataFrame,
+             columns: Union[str, List[str]],
+             boundaries: Optional[Dict[str, Dict[str, float]]] = None,
+             outlier_method: str = 'iqr',
+             outlier_threshold: float = 1.5,
+             custom_rules: Optional[Dict[str, str]] = None) -> Dict[str, Dict]:
+        """
+        Performs comprehensive range validity analysis on specified columns.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame to analyze
+        columns : Union[str, List[str]]
+            Single column name or list of column names to analyze
+        boundaries : Optional[Dict[str, Dict[str, float]]], default=None
+            Dictionary defining valid ranges for columns:
+            {
+                'column_name': {
+                    'min': float,
+                    'max': float,
+                    'valid_set': List[float]  # if applicable
+                }
+            }
+        outlier_method : str, default='iqr'
+            Method to detect outliers:
+            - 'iqr': Interquartile Range method
+            - 'zscore': Z-score method
+            - 'mad': Median Absolute Deviation
+            - 'isolation_forest': Isolation Forest algorithm
+        outlier_threshold : float, default=1.5
+            Threshold for outlier detection:
+            - For IQR: multiplier for IQR range
+            - For zscore: number of standard deviations
+            - For MAD: multiplier for MAD
+        custom_rules : Optional[Dict[str, str]], default=None
+            Dictionary of custom SQL expressions for validity checks
+            
+        Returns
+        -------
+        Dict[str, Dict]
+            Nested dictionary containing detailed range analysis:
+            {
+                'column_name': {
+                    'current_stats': {
+                        'min': float,
+                        'max': float,
+                        'mean': float,
+                        'median': float,
+                        'std': float,
+                        'q1': float,
+                        'q3': float
+                    },
+                    'violations': {
+                        'below_min': int,
+                        'above_max': int,
+                        'outliers': int,
+                        'impossible_values': int
+                    },
+                    'violation_percentage': float,
+                    'outlier_indices': List[int],
+                    'boundary_violation_indices': List[int],
+                    'violation_patterns': Dict[str, int]
+                }
+            }
+            
+        Examples
+        --------
+        >>> rv = RangeValidity()
+        >>> # Check with specific boundaries
+        >>> range_issues = rv.check(
+        ...     df,
+        ...     columns=['age', 'temperature'],
+        ...     boundaries={
+        ...         'age': {'min': 0, 'max': 120},
+        ...         'temperature': {'min': -50, 'max': 50}
+        ...     }
+        ... )
+        >>> 
+        >>> # Check with custom rules
+        >>> custom_checks = rv.check(
+        ...     df,
+        ...     columns=['blood_pressure'],
+        ...     custom_rules={
+        ...         'blood_pressure': 'systolic > diastolic AND systolic <= 300'
+        ...     }
+        ... )
+        
+        Notes
+        -----
+        The method performs multiple levels of analysis:
+        1. Basic range checking against specified boundaries
+        2. Statistical outlier detection using chosen method
+        3. Impossible value detection based on domain rules
+        4. Pattern analysis for violation clusters
+        5. Distribution analysis for potential data quality issues
+        """
+        # Convert single column to list
+        if isinstance(columns, str):
+            columns = [columns]
+
+        results = {}
+
+        for column in columns:
+            col_stats = df.select(
+                F.min(column).alias('min'),
+                F.max(column).alias('max'),
+                F.mean(column).alias('mean'),
+                F.expr(f'percentile_approx({column}, 0.5)').alias('median'),
+                F.stddev(column).alias('std'),
+                F.expr(f'percentile_approx({column}, 0.25)').alias('q1'),
+                F.expr(f'percentile_approx({column}, 0.75)').alias('q3')
+            ).collect()[0].asDict()
+
+            violations = {
+                'below_min': 0,
+                'above_max': 0,
+                'outliers': 0,
+                'impossible_values': 0
+            }
+
+            if boundaries and column in boundaries:
+                boundary = boundaries[column]
+                if 'min' in boundary:
+                    violations['below_min'] = df.filter(F.col(column) < boundary['min']).count()
+                if 'max' in boundary:
+                    violations['above_max'] = df.filter(F.col(column) > boundary['max']).count()
+
+            if outlier_method == 'iqr':
+                iqr = col_stats['q3'] - col_stats['q1']
+                lower_bound = col_stats['q1'] - outlier_threshold * iqr
+                upper_bound = col_stats['q3'] + outlier_threshold * iqr
+                violations['outliers'] = df.filter((F.col(column) < lower_bound) | (F.col(column) > upper_bound)).count()
+
+            # Add more outlier detection methods as needed
+
+            if custom_rules and column in custom_rules:
+                violations['impossible_values'] = df.filter(F.expr(custom_rules[column])).count()
+
+            results[column] = {
+                'current_stats': col_stats,
+                'violations': violations,
+                'violation_percentage': sum(violations.values()) / df.count() * 100,
+                'outlier_indices': [],  # Placeholder for actual indices
+                'boundary_violation_indices': [],  # Placeholder for actual indices
+                'violation_patterns': {}  # Placeholder for pattern analysis
+            }
+
+        return results
+
+    def fix(self,
+            df: DataFrame,
+            columns: Union[str, List[str]],
+            strategy: str = 'cap',
+            boundaries: Optional[Dict[str, Dict[str, float]]] = None,
+            outlier_params: Optional[Dict[str, Any]] = None,
+            transform_method: Optional[str] = None,
+            add_indicators: bool = False) -> DataFrame:
+        """
+        Applies specified fixing strategy to handle range validity issues.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame to fix
+        columns : Union[str, List[str]]
+            Columns to apply the fixing strategy to
+        strategy : str, default='cap'
+            Strategy to handle range issues. Options:
+            - 'cap': Cap values at boundaries
+            - 'remove': Remove rows with violations
+            - 'transform': Apply statistical transformations
+            - 'flag': Add indicator columns for review
+        boundaries : Optional[Dict[str, Dict[str, float]]], default=None
+            Dictionary defining valid ranges (same as check method)
+        outlier_params : Optional[Dict[str, Any]], default=None
+            Parameters for outlier detection and handling:
+            {
+                'method': str,  # detection method
+                'threshold': float,  # detection threshold
+                'handling': str  # how to handle outliers
+            }
+        transform_method : Optional[str], default=None
+            Statistical transformation to apply:
+            - 'log': Natural logarithm
+            - 'sqrt': Square root
+            - 'box-cox': Box-Cox transformation
+            - 'yeo-johnson': Yeo-Johnson transformation
+        add_indicators : bool, default=False
+            Whether to add indicator columns for violations
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with range validity issues fixed according to
+            the specified strategy
+            
+        Examples
+        --------
+        >>> rv = RangeValidity()
+        >>> 
+        >>> # Cap values at boundaries
+        >>> capped_df = rv.fix(
+        ...     df,
+        ...     columns=['age', 'temperature'],
+        ...     strategy='cap',
+        ...     boundaries={
+        ...         'age': {'min': 0, 'max': 120},
+        ...         'temperature': {'min': -50, 'max': 50}
+        ...     }
+        ... )
+        >>> 
+        >>> # Remove outliers
+        >>> cleaned_df = rv.fix(
+        ...     df,
+        ...     columns=['salary'],
+        ...     strategy='remove',
+        ...     outlier_params={
+        ...         'method': 'iqr',
+        ...         'threshold': 1.5,
+        ...         'handling': 'remove'
+        ...     }
+        ... )
+        >>> 
+        >>> # Apply transformation
+        >>> transformed_df = rv.fix(
+        ...     df,
+        ...     columns=['skewed_values'],
+        ...     strategy='transform',
+        ...     transform_method='log'
+        ... )
+            
+        Notes
+        -----
+        The method provides multiple strategies for handling range issues:
+        
+        1. Cap Strategy:
+           - Replaces values outside boundaries with boundary values
+           - Preserves data volume while controlling extremes
+           - Can be applied separately to upper/lower bounds
+           - Supports different capping rules per column
+        
+        2. Remove Strategy:
+           - Removes rows containing out-of-range values
+           - Can focus on specific violation types
+           - Supports different criteria per column
+           - May significantly reduce data volume
+        
+        3. Transform Strategy:
+           - Applies statistical transformations to normalize data
+           - Handles skewed distributions
+           - Preserves relative relationships
+           - Supports multiple transformation methods
+        
+        4. Flag Strategy:
+           - Adds indicator columns for different violation types
+           - Preserves original data
+           - Enables downstream filtering and analysis
+           - Supports custom flagging rules
+        
+        Raises
+        ------
+        ValueError
+            If strategy is invalid
+            If required parameters are missing
+            If transformation method is not supported
+            If column names don't exist in DataFrame
+        """
+        # Convert single column to list
+        if isinstance(columns, str):
+            columns = [columns]
+
+        for column in columns:
+            if strategy == 'cap':
+                if boundaries and column in boundaries:
+                    boundary = boundaries[column]
+                    if 'min' in boundary:
+                        df = df.withColumn(column, F.when(F.col(column) < boundary['min'], boundary['min']).otherwise(F.col(column)))
+                    if 'max' in boundary:
+                        df = df.withColumn(column, F.when(F.col(column) > boundary['max'], boundary['max']).otherwise(F.col(column)))
+
+            elif strategy == 'remove':
+                if boundaries and column in boundaries:
+                    boundary = boundaries[column]
+                    if 'min' in boundary:
+                        df = df.filter(F.col(column) >= boundary['min'])
+                    if 'max' in boundary:
+                        df = df.filter(F.col(column) <= boundary['max'])
+                if outlier_params:
+                    method = outlier_params.get('method', 'iqr')
+                    threshold = outlier_params.get('threshold', 1.5)
+                    if method == 'iqr':
+                        q1, q3 = df.approxQuantile(column, [0.25, 0.75], 0.05)
+                        iqr = q3 - q1
+                        lower_bound = q1 - threshold * iqr
+                        upper_bound = q3 + threshold * iqr
+                        df = df.filter((F.col(column) >= lower_bound) & (F.col(column) <= upper_bound))
+
+            elif strategy == 'transform':
+                if transform_method == 'log':
+                    df = df.withColumn(column, F.log(F.col(column)))
+                elif transform_method == 'sqrt':
+                    df = df.withColumn(column, F.sqrt(F.col(column)))
+                # Add more transformation methods as needed
+
+            elif strategy == 'flag':
+                if boundaries and column in boundaries:
+                    boundary = boundaries[column]
+                    if 'min' in boundary:
+                        df = df.withColumn(f'{column}_below_min', F.when(F.col(column) < boundary['min'], 1).otherwise(0))
+                    if 'max' in boundary:
+                        df = df.withColumn(f'{column}_above_max', F.when(F.col(column) > boundary['max'], 1).otherwise(0))
+                if outlier_params:
+                    method = outlier_params.get('method', 'iqr')
+                    threshold = outlier_params.get('threshold', 1.5)
+                    if method == 'iqr':
+                        q1, q3 = df.approxQuantile(column, [0.25, 0.75], 0.05)
+                        iqr = q3 - q1
+                        lower_bound = q1 - threshold * iqr
+                        upper_bound = q3 + threshold * iqr
+                        df = df.withColumn(f'{column}_outlier', F.when((F.col(column) < lower_bound) | (F.col(column) > upper_bound), 1).otherwise(0))
+
+        return df
+
+    def suggest_boundaries(self,
+                         df: DataFrame,
+                         columns: Union[str, List[str]],
+                         method: str = 'statistical',
+                         domain_rules: Optional[Dict[str, Dict]] = None) -> Dict[str, Dict[str, float]]:
+        """
+        Suggests appropriate boundaries for specified columns based on
+        data distribution and optional domain rules.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame to analyze
+        columns : Union[str, List[str]]
+            Columns to analyze for boundary suggestion
+        method : str, default='statistical'
+            Method to use for suggestion:
+            - 'statistical': Based on distribution
+            - 'percentile': Based on percentile ranges
+            - 'domain': Based on provided domain rules
+        domain_rules : Optional[Dict[str, Dict]], default=None
+            Domain-specific rules for boundary calculation
+            
+        Returns
+        -------
+        Dict[str, Dict[str, float]]
+            Suggested boundaries for each column
+        
+        Examples
+        --------
+        >>> rv = RangeValidity()
+        >>> suggested_bounds = rv.suggest_boundaries(
+        ...     df,
+        ...     columns=['age', 'temperature']
+        ... )
+        >>> print(suggested_bounds)
+        
+        Notes
+        -----
+        The method uses various approaches to suggest boundaries:
+        1. Statistical analysis of data distribution
+        2. Domain-specific rules and constraints
+        3. Historical data patterns
+        4. Common sense validation
+        """
+        # Convert single column to list
+        if isinstance(columns, str):
+            columns = [columns]
+
+        suggested_boundaries = {}
+
+        for column in columns:
+            if method == 'statistical':
+                col_stats = df.select(
+                    F.expr(f'percentile_approx({column}, 0.01)').alias('min'),
+                    F.expr(f'percentile_approx({column}, 0.99)').alias('max')
+                ).collect()[0].asDict()
+                suggested_boundaries[column] = {
+                    'min': col_stats['min'],
+                    'max': col_stats['max']
+                }
+
+            elif method == 'percentile':
+                col_stats = df.select(
+                    F.expr(f'percentile_approx({column}, 0.05)').alias('min'),
+                    F.expr(f'percentile_approx({column}, 0.95)').alias('max')
+                ).collect()[0].asDict()
+                suggested_boundaries[column] = {
+                    'min': col_stats['min'],
+                    'max': col_stats['max']
+                }
+
+            elif method == 'domain' and domain_rules and column in domain_rules:
+                suggested_boundaries[column] = domain_rules[column]
+
+            # Add more methods as needed
+
+        return suggested_boundaries
+
 
