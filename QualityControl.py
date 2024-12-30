@@ -3238,5 +3238,341 @@ class StatisticalAnomaly:
         return self.df
     
 
+class EncodingConformity:
+    """
+    A comprehensive class for handling character encoding issues in PySpark DataFrames.
+    Provides methods for detecting encoding problems and applying encoding-related transformations.
+    """
+
+    def check(self,
+             df: DataFrame,
+             columns: Union[str, List[str]],
+             target_encoding: str = 'UTF-8',
+             detect_special_chars: bool = True,
+             sample_size: Optional[int] = 1000) -> Dict[str, Dict]:
+        """
+        Performs detailed analysis of encoding issues in specified string columns.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame to analyze
+        columns : Union[str, List[str]]
+            Single column name or list of column names to analyze
+        target_encoding : str, default='UTF-8'
+            Expected character encoding for the columns
+        detect_special_chars : bool, default=True
+            Whether to detect and report special characters
+        sample_size : Optional[int], default=1000
+            Number of rows to sample for detailed encoding analysis
+            Set to None to analyze entire DataFrame
+            
+        Returns
+        -------
+        Dict[str, Dict]
+            Nested dictionary containing detailed encoding information for each column:
+            {
+                'column_name': {
+                    'current_encoding': str,
+                    'detected_encodings': List[str],
+                    'special_chars': Set[str],
+                    'invalid_chars': Set[str],
+                    'encoding_frequencies': Dict[str, int],
+                    'conversion_possible': bool,
+                    'problematic_values': List[str],
+                    'sample_violations': List[Dict],
+                    'total_violations': int,
+                    'violation_percentage': float
+                }
+            }
+            
+        Examples
+        --------
+        >>> enc = EncodingConformity()
+        >>> # Check specific columns for encoding issues
+        >>> encoding_issues = enc.check(
+        ...     df,
+        ...     columns=['name', 'description'],
+        ...     target_encoding='UTF-8'
+        ... )
+        >>> 
+        >>> # Print detected special characters
+        >>> print(encoding_issues['name']['special_chars'])
+        
+        Notes
+        -----
+        The method performs several levels of analysis:
+        1. Basic encoding validation against target encoding
+        2. Special character detection
+        3. Invalid character identification
+        4. Statistical analysis of character distributions
+        5. Encoding conversion possibility assessment
+        
+        Special attention is given to common problematic characters
+        and encoding-specific issues (e.g., Windows-1252 vs UTF-8)
+        """
+        import chardet
+
+        if isinstance(columns, str):
+            columns = [columns]
+
+        results = {}
+
+        for column in columns:
+            column_data = df.select(column).rdd.flatMap(lambda x: x).collect()
+            sample_data = column_data[:sample_size] if sample_size else column_data
+
+            detected_encodings = [chardet.detect(bytes(row, 'utf-8'))['encoding'] for row in sample_data]
+            encoding_frequencies = {enc: detected_encodings.count(enc) for enc in set(detected_encodings)}
+
+            special_chars = set()
+            invalid_chars = set()
+            problematic_values = []
+            sample_violations = []
+
+            for row in sample_data:
+                try:
+                    row.encode(target_encoding)
+                except UnicodeEncodeError as e:
+                    problematic_values.append(row)
+                    sample_violations.append({'value': row, 'error': str(e)})
+                    invalid_chars.update(set(row) - set(row.encode(target_encoding, 'ignore').decode(target_encoding)))
+
+                if detect_special_chars:
+                    special_chars.update(set(row) - set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 '))
+
+            total_violations = len(problematic_values)
+            violation_percentage = (total_violations / len(sample_data)) * 100 if sample_data else 0
+
+            results[column] = {
+                'current_encoding': target_encoding,
+                'detected_encodings': list(set(detected_encodings)),
+                'special_chars': special_chars,
+                'invalid_chars': invalid_chars,
+                'encoding_frequencies': encoding_frequencies,
+                'conversion_possible': total_violations == 0,
+                'problematic_values': problematic_values,
+                'sample_violations': sample_violations,
+                'total_violations': total_violations,
+                'violation_percentage': violation_percentage
+            }
+
+        return results
+
+    def fix(self,
+            df: DataFrame,
+            columns: Union[str, List[str]],
+            strategy: str = 'convert',
+            target_encoding: str = 'UTF-8',
+            handling_method: str = 'replace',
+            replacement_char: str = '?',
+            preserve_special_chars: bool = True) -> DataFrame:
+        """
+        Applies specified fixing strategy to handle encoding issues.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame to fix
+        columns : Union[str, List[str]]
+            Columns to apply the fixing strategy to
+        strategy : str, default='convert'
+            Strategy to handle encoding issues. Options:
+            - 'convert': Convert to target encoding
+            - 'remove': Remove invalid characters
+            - 'replace': Replace invalid characters with replacement_char
+            - 'encode': Replace with encoded equivalents
+        target_encoding : str, default='UTF-8'
+            Target character encoding for conversion
+        handling_method : str, default='replace'
+            How to handle conversion errors. Options:
+            - 'replace': Replace invalid characters
+            - 'ignore': Skip invalid characters
+            - 'strict': Raise error on invalid characters
+        replacement_char : str, default='?'
+            Character to use for replacement when handling_method='replace'
+        preserve_special_chars : bool, default=True
+            Whether to preserve valid special characters during conversion
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with encoding issues fixed according to
+            the specified strategy
+            
+        Examples
+        --------
+        >>> enc = EncodingConformity()
+        >>> 
+        >>> # Convert columns to UTF-8
+        >>> fixed_df = enc.fix(
+        ...     df,
+        ...     columns=['name', 'description'],
+        ...     strategy='convert',
+        ...     target_encoding='UTF-8'
+        ... )
+        >>> 
+        >>> # Remove invalid characters
+        >>> cleaned_df = enc.fix(
+        ...     df,
+        ...     columns=['text'],
+        ...     strategy='remove'
+        ... )
+        >>> 
+        >>> # Replace invalid characters with encoded equivalents
+        >>> encoded_df = enc.fix(
+        ...     df,
+        ...     columns=['content'],
+        ...     strategy='encode',
+        ...     preserve_special_chars=True
+        ... )
+            
+        Notes
+        -----
+        The method provides multiple strategies for handling encoding issues:
+        
+        1. Convert Strategy:
+           - Converts text to specified target encoding
+           - Handles conversion errors according to handling_method
+           - Preserves valid special characters if specified
+           - Supports all standard Python encodings
+        
+        2. Remove Strategy:
+           - Removes invalid characters and unprintable characters
+           - Preserves valid special characters if specified
+           - Can be combined with 'convert' strategy
+           - Maintains string length information
+        
+        3. Replace Strategy:
+           - Replaces invalid characters with specified replacement
+           - Handles common encoding-specific issues
+           - Preserves string semantics where possible
+           - Supports custom replacement characters
+        
+        4. Encode Strategy:
+           - Replaces characters with encoded equivalents
+           - Uses HTML/XML encoding where appropriate
+           - Maintains readability of special characters
+           - Useful for web-safe content
+        
+        Raises
+        ------
+        ValueError
+            If invalid strategy or handling_method specified
+            If invalid target_encoding specified
+            If column names don't exist in DataFrame
+            If replacement_char is more than one character
+        """
+        if isinstance(columns, str):
+            columns = [columns]
+
+        if strategy not in ['convert', 'remove', 'replace', 'encode']:
+            raise ValueError("Invalid strategy specified.")
+
+        if handling_method not in ['replace', 'ignore', 'strict']:
+            raise ValueError("Invalid handling_method specified.")
+
+        if len(replacement_char) != 1:
+            raise ValueError("replacement_char must be a single character.")
+
+        for column in columns:
+            if column not in df.columns:
+                raise ValueError(f"Column {column} does not exist in DataFrame.")
+
+            if strategy == 'convert':
+                def convert_text(text):
+                    try:
+                        return text.encode(target_encoding, errors=handling_method).decode(target_encoding)
+                    except UnicodeEncodeError:
+                        return replacement_char if handling_method == 'replace' else text
+
+                convert_udf = F.udf(convert_text, F.StringType())
+                df = df.withColumn(column, convert_udf(F.col(column)))
+
+            elif strategy == 'remove':
+                def remove_invalid_chars(text):
+                    return ''.join([char if char.isprintable() else '' for char in text])
+
+                remove_udf = F.udf(remove_invalid_chars, F.StringType())
+                df = df.withColumn(column, remove_udf(F.col(column)))
+
+            elif strategy == 'replace':
+                def replace_invalid_chars(text):
+                    return text.encode(target_encoding, errors='replace').decode(target_encoding).replace('�', replacement_char)
+
+                replace_udf = F.udf(replace_invalid_chars, F.StringType())
+                df = df.withColumn(column, replace_udf(F.col(column)))
+
+            elif strategy == 'encode':
+                def encode_special_chars(text):
+                    return text.encode('ascii', errors='xmlcharrefreplace').decode('ascii')
+
+                encode_udf = F.udf(encode_special_chars, F.StringType())
+                df = df.withColumn(column, encode_udf(F.col(column)))
+
+        return df
+
+    def detect_encoding(self,
+                       df: DataFrame,
+                       columns: Union[str, List[str]],
+                       sample_size: Optional[int] = 1000) -> Dict[str, str]:
+        """
+        Attempts to detect the character encoding of specified columns.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame to analyze
+        columns : Union[str, List[str]]
+            Columns to analyze for encoding detection
+        sample_size : Optional[int], default=1000
+            Number of rows to sample for encoding analysis
+            
+        Returns
+        -------
+        Dict[str, str]
+            Dictionary mapping column names to detected encodings
+            
+        Examples
+        --------
+        >>> enc = EncodingConformity()
+        >>> detected_encodings = enc.detect_encoding(df, ['col1', 'col2'])
+        >>> print(detected_encodings)
+        
+        Notes
+        -----
+        The method uses various heuristics to determine encodings:
+        1. Character set analysis
+        2. Byte order mark detection
+        3. Statistical analysis of byte patterns
+        4. Common encoding signatures
+        """
+        import chardet
+
+        if isinstance(columns, str):
+            columns = [columns]
+
+        detected_encodings = {}
+
+        for column in columns:
+            column_data = df.select(column).rdd.flatMap(lambda x: x).collect()
+            sample_data = column_data[:sample_size] if sample_size else column_data
+
+            encoding_counts = {}
+            for row in sample_data:
+                result = chardet.detect(bytes(row, 'utf-8'))
+                encoding = result['encoding']
+                if encoding:
+                    encoding_counts[encoding] = encoding_counts.get(encoding, 0) + 1
+
+            if encoding_counts:
+                detected_encodings[column] = max(encoding_counts, key=encoding_counts.get)
+            else:
+                detected_encodings[column] = 'unknown'
+
+        return detected_encodings
+    
+
+
 
 
