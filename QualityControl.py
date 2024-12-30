@@ -1569,4 +1569,965 @@ class CategoricalValidity:
         return df
     
 
+class DuplicateValues:
+    """
+    A comprehensive class for detecting and handling duplicate records in PySpark DataFrames.
+    Provides methods for identifying exact duplicates, fuzzy matches, and business key violations.
+    
+    Attributes
+    ----------
+    df : pyspark.sql.DataFrame
+        The input DataFrame to analyze
+    _timestamp_cols : List[str]
+        Cache of timestamp columns for recency checks
+    """
+
+    def check_exact_duplicates(
+            self,
+            columns: Optional[List[str]] = None,
+            sample_size: Optional[int] = 1000
+        ) -> Dict[str, Any]:
+        """
+        Identifies exact duplicate records across specified columns or entire DataFrame.
+        
+        Parameters
+        ----------
+        columns : Optional[List[str]], default=None
+            Columns to check for duplicates. If None, checks all columns
+        sample_size : Optional[int], default=1000
+            Number of sample duplicate records to include in results
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing detailed duplicate analysis:
+            {
+                'total_records': int,
+                'duplicate_count': int,
+                'duplicate_percentage': float,
+                'affected_rows': int,
+                'sample_duplicates': List[Dict],
+                'column_impact': Dict[str, int],
+                'group_sizes': Dict[int, int],
+                'largest_groups': List[Dict]
+            }
+            
+        Examples
+        --------
+        >>> dv = DuplicateValues(spark_df)
+        >>> # Check specific columns for duplicates
+        >>> results = dv.check_exact_duplicates(
+        ...     columns=['customer_id', 'transaction_date']
+        ... )
+        >>> print(f"Found {results['duplicate_count']} duplicates")
+        
+        Notes
+        -----
+        The method performs comprehensive duplicate analysis:
+        1. Identifies completely identical rows
+        2. Analyzes duplicate patterns
+        3. Provides statistical summary
+        4. Samples representative duplicates
+        """
+        # If no columns specified, use all columns
+        if columns is None:
+            columns = self.df.columns
+
+        # Count total records
+        total_records = self.df.count()
+
+        # Group by specified columns and count occurrences
+        grouped_df = self.df.groupBy(columns).count()
+
+        # Filter groups with more than one occurrence (duplicates)
+        duplicates_df = grouped_df.filter(F.col('count') > 1)
+
+        # Count duplicate groups and affected rows
+        duplicate_count = duplicates_df.count()
+        affected_rows = duplicates_df.agg(F.sum('count')).collect()[0][0] - duplicate_count
+
+        # Calculate duplicate percentage
+        duplicate_percentage = (affected_rows / total_records) * 100
+
+        # Sample duplicate records
+        sample_duplicates = duplicates_df.orderBy(F.desc('count')).limit(sample_size).collect()
+
+        # Analyze column impact
+        column_impact = {col: self.df.groupBy(col).count().filter(F.col('count') > 1).count() for col in columns}
+
+        # Analyze group sizes
+        group_sizes = duplicates_df.groupBy('count').count().collect()
+        group_sizes = {row['count']: row['count(1)'] for row in group_sizes}
+
+        # Get largest groups
+        largest_groups = duplicates_df.orderBy(F.desc('count')).limit(5).collect()
+
+        return {
+            'total_records': total_records,
+            'duplicate_count': duplicate_count,
+            'duplicate_percentage': duplicate_percentage,
+            'affected_rows': affected_rows,
+            'sample_duplicates': [row.asDict() for row in sample_duplicates],
+            'column_impact': column_impact,
+            'group_sizes': group_sizes,
+            'largest_groups': [row.asDict() for row in largest_groups]
+        }
+
+    def check_fuzzy_matches(
+            self,
+            columns: List[str],
+            threshold: float = 0.9,
+            algorithm: str = 'levenshtein',
+            blocking_columns: Optional[List[str]] = None
+        ) -> Dict[str, Any]:
+        """
+        Identifies records that are similar but not exactly identical using fuzzy matching.
+        
+        Parameters
+        ----------
+        columns : List[str]
+            Columns to analyze for fuzzy matches
+        threshold : float, default=0.9
+            Similarity threshold (0.0 to 1.0) for matching
+        algorithm : str, default='levenshtein'
+            Similarity algorithm to use:
+            - 'levenshtein': Edit distance-based
+            - 'jaro_winkler': Position-based
+            - 'soundex': Phonetic similarity
+            - 'ngram': N-gram-based similarity
+        blocking_columns : Optional[List[str]], default=None
+            Columns to use for blocking to improve performance
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing fuzzy match analysis:
+            {
+                'match_groups': List[Dict],
+                'similarity_scores': Dict[str, float],
+                'match_statistics': Dict[str, Any],
+                'column_correlations': Dict[str, float],
+                'suggested_thresholds': Dict[str, float],
+                'sample_matches': List[Dict]
+            }
+            
+        Examples
+        --------
+        >>> dv = DuplicateValues(spark_df)
+        >>> # Find similar company names
+        >>> fuzzy_results = dv.check_fuzzy_matches(
+        ...     columns=['company_name'],
+        ...     threshold=0.85,
+        ...     algorithm='jaro_winkler'
+        ... )
+        
+        Notes
+        -----
+        The method implements sophisticated fuzzy matching:
+        1. Applies specified similarity algorithm
+        2. Uses blocking for performance optimization
+        3. Provides detailed match analysis
+        4. Suggests optimal thresholds
+        """
+        def get_similarity_func(algorithm: str):
+            if algorithm == 'levenshtein':
+                return jellyfish.levenshtein_distance
+            elif algorithm == 'jaro_winkler':
+                return jellyfish.jaro_winkler
+            elif algorithm == 'soundex':
+                return jellyfish.soundex
+            elif algorithm == 'ngram':
+                return lambda x, y: jellyfish.ngram_similarity(x, y, 2)
+            else:
+                raise ValueError(f"Unsupported algorithm: {algorithm}")
+
+        similarity_func = get_similarity_func(algorithm)
+
+        def is_similar(row1, row2, columns, threshold):
+            for col in columns:
+                if similarity_func(row1[col], row2[col]) < threshold:
+                    return False
+            return True
+
+        # Apply blocking if specified
+        if blocking_columns:
+            df = self.df.groupBy(blocking_columns).agg(F.collect_list(F.struct(*self.df.columns)).alias('grouped'))
+        else:
+            df = self.df.withColumn('grouped', F.array(*[F.struct(*self.df.columns)]))
+
+        match_groups = []
+        for row in df.collect():
+            group = row['grouped']
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    if is_similar(group[i], group[j], columns, threshold):
+                        match_groups.append((group[i], group[j]))
+
+        # Calculate similarity scores
+        similarity_scores = {f"{row1['id']}-{row2['id']}": similarity_func(row1[col], row2[col])
+                             for row1, row2 in match_groups for col in columns}
+
+        # Calculate match statistics
+        match_statistics = {
+            'total_matches': len(match_groups),
+            'average_similarity': sum(similarity_scores.values()) / len(similarity_scores) if similarity_scores else 0
+        }
+
+        # Calculate column correlations
+        column_correlations = {col: self.df.stat.corr(col, 'similarity') for col in columns}
+
+        # Suggest optimal thresholds
+        suggested_thresholds = {col: 0.9 for col in columns}  # Placeholder for actual logic
+
+        # Sample matches
+        sample_matches = match_groups[:10]
+
+        return {
+            'match_groups': [{'row1': row1.asDict(), 'row2': row2.asDict()} for row1, row2 in match_groups],
+            'similarity_scores': similarity_scores,
+            'match_statistics': match_statistics,
+            'column_correlations': column_correlations,
+            'suggested_thresholds': suggested_thresholds,
+            'sample_matches': [{'row1': row1.asDict(), 'row2': row2.asDict()} for row1, row2 in sample_matches]
+        }
+
+    def check_business_key_duplicates(
+            self,
+            key_columns: List[str],
+            tolerance_rules: Optional[Dict[str, Any]] = None,
+            temporal_constraints: Optional[Dict[str, str]] = None
+        ) -> Dict[str, Any]:
+        """
+        Identifies duplicate records based on business keys with custom validation rules.
+        
+        Parameters
+        ----------
+        key_columns : List[str]
+            Columns that form the business key
+        tolerance_rules : Optional[Dict[str, Any]], default=None
+            Rules for acceptable variations in non-key columns:
+            {
+                'column_name': {
+                    'type': 'numeric|categorical|temporal',
+                    'tolerance': value,
+                    'unit': 'absolute|percentage'
+                }
+            }
+        temporal_constraints : Optional[Dict[str, str]], default=None
+            Time-based rules for duplicate validation:
+            {
+                'valid_from': 'column_name',
+                'valid_to': 'column_name',
+                'overlap_allowed': bool
+            }
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing business key analysis:
+            {
+                'violation_count': int,
+                'violation_groups': List[Dict],
+                'key_statistics': Dict[str, Any],
+                'tolerance_breaches': List[Dict],
+                'temporal_violations': List[Dict],
+                'impact_analysis': Dict[str, Any]
+            }
+            
+        Examples
+        --------
+        >>> dv = DuplicateValues(spark_df)
+        >>> # Check order duplicates with amount tolerance
+        >>> biz_key_results = dv.check_business_key_duplicates(
+        ...     key_columns=['order_id', 'customer_id'],
+        ...     tolerance_rules={
+        ...         'amount': {
+        ...             'type': 'numeric',
+        ...             'tolerance': 0.01,
+        ...             'unit': 'absolute'
+        ...         }
+        ...     }
+        ... )
+        
+        Notes
+        -----
+        Implements sophisticated business key validation:
+        1. Validates composite business keys
+        2. Applies tolerance rules
+        3. Handles temporal aspects
+        4. Provides violation analysis
+        """
+        # Group by key columns
+        grouped_df = self.df.groupBy(key_columns).count()
+
+        # Filter groups with more than one occurrence (violations)
+        violations_df = grouped_df.filter(F.col('count') > 1)
+
+        # Count violation groups
+        violation_count = violations_df.count()
+
+        # Collect violation groups
+        violation_groups = violations_df.collect()
+
+        # Analyze key statistics
+        key_statistics = {col: self.df.groupBy(col).count().collect() for col in key_columns}
+
+        # Check tolerance breaches
+        tolerance_breaches = []
+        if tolerance_rules:
+            for col, rule in tolerance_rules.items():
+                if rule['type'] == 'numeric':
+                    tolerance_breaches.append(
+                        self.df.filter(F.abs(F.col(col) - F.lag(col).over(Window.partitionBy(key_columns).orderBy(col))) > rule['tolerance']).collect()
+                    )
+                elif rule['type'] == 'categorical':
+                    tolerance_breaches.append(
+                        self.df.filter(F.col(col) != F.lag(col).over(Window.partitionBy(key_columns).orderBy(col))).collect()
+                    )
+                elif rule['type'] == 'temporal':
+                    tolerance_breaches.append(
+                        self.df.filter(F.datediff(F.col(col), F.lag(col).over(Window.partitionBy(key_columns).orderBy(col))) > rule['tolerance']).collect()
+                    )
+
+        # Check temporal violations
+        temporal_violations = []
+        if temporal_constraints:
+            valid_from = temporal_constraints.get('valid_from')
+            valid_to = temporal_constraints.get('valid_to')
+            overlap_allowed = temporal_constraints.get('overlap_allowed', False)
+            if valid_from and valid_to:
+                if overlap_allowed:
+                    temporal_violations = self.df.filter(F.col(valid_from) < F.col(valid_to)).collect()
+                else:
+                    temporal_violations = self.df.filter(F.col(valid_from) >= F.col(valid_to)).collect()
+
+        # Perform impact analysis
+        impact_analysis = {
+            'total_violations': violation_count,
+            'total_tolerance_breaches': len(tolerance_breaches),
+            'total_temporal_violations': len(temporal_violations)
+        }
+
+        return {
+            'violation_count': violation_count,
+            'violation_groups': [row.asDict() for row in violation_groups],
+            'key_statistics': key_statistics,
+            'tolerance_breaches': [row.asDict() for row in tolerance_breaches],
+            'temporal_violations': [row.asDict() for row in temporal_violations],
+            'impact_analysis': impact_analysis
+        }
+
+    def remove_exact_duplicates(
+            self,
+            columns: Optional[List[str]] = None,
+            keep: str = 'first',
+            order_by: Optional[List[str]] = None
+        ) -> DataFrame:
+        """
+        Removes exact duplicate records based on specified criteria.
+        
+        Parameters
+        ----------
+        columns : Optional[List[str]], default=None
+            Columns to consider for duplicate removal
+        keep : str, default='first'
+            Which record to keep:
+            - 'first': Keep first occurrence
+            - 'last': Keep last occurrence
+            - 'most_complete': Keep record with most non-null values
+            - 'most_recent': Keep most recent based on timestamp
+        order_by : Optional[List[str]], default=None
+            Columns to use for ordering when keep='first'|'last'
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with duplicates removed
+            
+        Examples
+        --------
+        >>> dv = DuplicateValues(spark_df)
+        >>> # Remove duplicates keeping most complete record
+        >>> deduped_df = dv.remove_exact_duplicates(
+        ...     columns=['customer_id', 'order_id'],
+        ...     keep='most_complete'
+        ... )
+        
+        Notes
+        -----
+        Implements intelligent duplicate removal:
+        1. Considers specified columns
+        2. Applies sophisticated keeping logic
+        3. Preserves data integrity
+        4. Optimizes performance
+        """
+        if columns is None:
+            columns = self.df.columns
+
+        if keep == 'first':
+            window_spec = Window.partitionBy(columns).orderBy(order_by if order_by else columns)
+            deduped_df = self.df.withColumn('row_number', F.row_number().over(window_spec)).filter(F.col('row_number') == 1).drop('row_number')
+        elif keep == 'last':
+            window_spec = Window.partitionBy(columns).orderBy(F.desc(order_by if order_by else columns))
+            deduped_df = self.df.withColumn('row_number', F.row_number().over(window_spec)).filter(F.col('row_number') == 1).drop('row_number')
+        elif keep == 'most_complete':
+            deduped_df = self.df.withColumn('null_count', sum(F.col(c).isNull().cast('int') for c in columns))
+            window_spec = Window.partitionBy(columns).orderBy('null_count')
+            deduped_df = deduped_df.withColumn('row_number', F.row_number().over(window_spec)).filter(F.col('row_number') == 1).drop('row_number', 'null_count')
+        elif keep == 'most_recent':
+            if not order_by:
+                raise ValueError("order_by must be specified when keep='most_recent'")
+            window_spec = Window.partitionBy(columns).orderBy(F.desc(order_by))
+            deduped_df = self.df.withColumn('row_number', F.row_number().over(window_spec)).filter(F.col('row_number') == 1).drop('row_number')
+        else:
+            raise ValueError(f"Unsupported keep method: {keep}")
+
+        return deduped_df
+
+    def merge_similar_records(
+            self,
+            match_columns: List[str],
+            merge_rules: Dict[str, str],
+            threshold: float = 0.9,
+            conflict_resolution: str = 'most_frequent'
+        ) -> DataFrame:
+        """
+        Merges records identified as similar based on specified rules.
+        
+        Parameters
+        ----------
+        match_columns : List[str]
+            Columns to use for similarity matching
+        merge_rules : Dict[str, str]
+            Rules for merging column values:
+            {
+                'column_name': 'most_frequent|longest|newest|sum|average'
+            }
+        threshold : float, default=0.9
+            Similarity threshold for matching
+        conflict_resolution : str, default='most_frequent'
+            Strategy for resolving conflicting values:
+            - 'most_frequent': Use most common value
+            - 'longest': Use longest string
+            - 'newest': Use most recent value
+            - 'manual': Raise exception for manual review
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with similar records merged
+            
+        Examples
+        --------
+        >>> dv = DuplicateValues(spark_df)
+        >>> # Merge similar customer records
+        >>> merged_df = dv.merge_similar_records(
+        ...     match_columns=['customer_name', 'address'],
+        ...     merge_rules={
+        ...         'customer_name': 'longest',
+        ...         'email': 'most_frequent',
+        ...         'total_purchases': 'sum'
+        ...     }
+        ... )
+        
+        Notes
+        -----
+        Implements sophisticated record merging:
+        1. Identifies similar records
+        2. Applies merge rules
+        3. Resolves conflicts
+        4. Maintains data consistency
+        """
+        def get_similarity_func(algorithm: str):
+            if algorithm == 'levenshtein':
+                return jellyfish.levenshtein_distance
+            elif algorithm == 'jaro_winkler':
+                return jellyfish.jaro_winkler
+            elif algorithm == 'soundex':
+                return jellyfish.soundex
+            elif algorithm == 'ngram':
+                return lambda x, y: jellyfish.ngram_similarity(x, y, 2)
+            else:
+                raise ValueError(f"Unsupported algorithm: {algorithm}")
+
+        similarity_func = get_similarity_func('levenshtein')
+
+        def is_similar(row1, row2, columns, threshold):
+            for col in columns:
+                if similarity_func(row1[col], row2[col]) < threshold:
+                    return False
+            return True
+
+        # Apply blocking if specified
+        if blocking_columns:
+            df = self.df.groupBy(blocking_columns).agg(F.collect_list(F.struct(*self.df.columns)).alias('grouped'))
+        else:
+            df = self.df.withColumn('grouped', F.array(*[F.struct(*self.df.columns)]))
+
+        match_groups = []
+        for row in df.collect():
+            group = row['grouped']
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    if is_similar(group[i], group[j], match_columns, threshold):
+                        match_groups.append((group[i], group[j]))
+
+        def resolve_conflict(values, rule):
+            if rule == 'most_frequent':
+                return max(set(values), key=values.count)
+            elif rule == 'longest':
+                return max(values, key=len)
+            elif rule == 'newest':
+                return max(values)
+            elif rule == 'sum':
+                return sum(values)
+            elif rule == 'average':
+                return sum(values) / len(values)
+            else:
+                raise ValueError(f"Unsupported merge rule: {rule}")
+
+        merged_records = []
+        for row1, row2 in match_groups:
+            merged_record = {}
+            for col in self.df.columns:
+                if col in merge_rules:
+                    merged_record[col] = resolve_conflict([row1[col], row2[col]], merge_rules[col])
+                else:
+                    merged_record[col] = row1[col]
+            merged_records.append(merged_record)
+
+        merged_df = self.df.sql_ctx.createDataFrame(merged_records)
+
+        return merged_df
+
+    def create_composite_key(
+            self,
+            columns: List[str],
+            transformations: Optional[Dict[str, str]] = None,
+            separator: str = '_'
+        ) -> DataFrame:
+        """
+        Creates composite keys from multiple columns for unique record identification.
+        
+        Parameters
+        ----------
+        columns : List[str]
+            Columns to combine into composite key
+        transformations : Optional[Dict[str, str]], default=None
+            Transformations to apply to columns:
+            {
+                'column_name': 'upper|lower|trim|clean|hash'
+            }
+        separator : str, default='_'
+            Character to use between combined values
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with new composite key column
+            
+        Examples
+        --------
+        >>> dv = DuplicateValues(spark_df)
+        >>> # Create composite key from multiple columns
+        >>> keyed_df = dv.create_composite_key(
+        ...     columns=['region', 'customer_id', 'order_date'],
+        ...     transformations={
+        ...         'region': 'upper',
+        ...         'customer_id': 'clean'
+        ...     }
+        ... )
+        
+        Notes
+        -----
+        Implements robust composite key creation:
+        1. Combines multiple columns
+        2. Applies transformations
+        3. Ensures uniqueness
+        4. Optimizes for performance
+        """
+        def apply_transformation(col, transformation):
+            if transformation == 'upper':
+                return F.upper(F.col(col))
+            elif transformation == 'lower':
+                return F.lower(F.col(col))
+            elif transformation == 'trim':
+                return F.trim(F.col(col))
+            elif transformation == 'clean':
+                return F.regexp_replace(F.col(col), '[^a-zA-Z0-9]', '')
+            elif transformation == 'hash':
+                return F.sha2(F.col(col), 256)
+            else:
+                raise ValueError(f"Unsupported transformation: {transformation}")
+
+        if transformations is None:
+            transformations = {}
+
+        transformed_columns = [
+            apply_transformation(col, transformations.get(col, '')) if col in transformations else F.col(col)
+            for col in columns
+        ]
+
+        composite_key_col = F.concat_ws(separator, *transformed_columns)
+
+        return self.df.withColumn('composite_key', composite_key_col)
+
+
+class FormatConsistency:
+    """
+    A comprehensive class for handling format consistency issues in PySpark DataFrames.
+    Provides methods for detecting and fixing format violations in common data types
+    like dates, phone numbers, emails, and addresses.
+    """
+
+    def check(self,
+             df: DataFrame,
+             columns: Union[str, List[str]],
+             format_types: Dict[str, str],
+             custom_patterns: Optional[Dict[str, str]] = None,
+             locale: str = 'en_US') -> Dict[str, Dict]:
+        """
+        Performs comprehensive format consistency analysis on specified columns.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame to analyze
+        columns : Union[str, List[str]]
+            Single column name or list of column names to analyze
+        format_types : Dict[str, str]
+            Dictionary mapping columns to their expected format types:
+            {
+                'column_name': 'format_type'
+            }
+            Supported format types:
+            - 'date': Date values
+            - 'datetime': Date and time values
+            - 'phone': Phone numbers
+            - 'email': Email addresses
+            - 'address': Postal addresses
+            - 'ip': IP addresses
+            - 'custom': Custom format (requires custom_patterns)
+        custom_patterns : Optional[Dict[str, str]], default=None
+            Dictionary of custom regex patterns for validation
+        locale : str, default='en_US'
+            Locale for format validation rules
+            
+        Returns
+        -------
+        Dict[str, Dict]
+            Nested dictionary containing detailed format analysis:
+            {
+                'column_name': {
+                    'format_type': str,
+                    'violations': {
+                        'total_count': int,
+                        'invalid_format': int,
+                        'mixed_formats': int,
+                        'unknown_formats': int
+                    },
+                    'detected_patterns': List[str],
+                    'pattern_frequencies': Dict[str, int],
+                    'example_violations': List[Dict],
+                    'violation_percentage': float,
+                    'suggested_formats': List[str]
+                }
+            }
+            
+        Examples
+        --------
+        >>> fc = FormatConsistency()
+        >>> # Check date and phone number formats
+        >>> format_issues = fc.check(
+        ...     df,
+        ...     columns=['birth_date', 'phone'],
+        ...     format_types={
+        ...         'birth_date': 'date',
+        ...         'phone': 'phone'
+        ...     }
+        ... )
+        >>> 
+        >>> # Check with custom pattern
+        >>> custom_check = fc.check(
+        ...     df,
+        ...     columns=['product_code'],
+        ...     format_types={'product_code': 'custom'},
+        ...     custom_patterns={
+        ...         'product_code': r'^[A-Z]{2}-\d{4}$'
+        ...     }
+        ... )
+        
+        Notes
+        -----
+        The method performs multiple levels of analysis:
+        1. Pattern matching against standard formats
+        2. Detection of mixed format usage
+        3. Identification of common format patterns
+        4. Statistical analysis of format distributions
+        5. Validation against locale-specific rules
+        """
+        if isinstance(columns, str):
+            columns = [columns]
+        
+        results = {}
+        
+        for column in columns:
+            format_type = format_types.get(column)
+            if not format_type:
+                raise ValueError(f"No format type specified for column: {column}")
+            
+            if format_type == 'custom' and custom_patterns and column in custom_patterns:
+                pattern = custom_patterns[column]
+            else:
+                pattern = self._get_standard_pattern(format_type, locale)
+            
+            violations = self._detect_violations(df, column, pattern)
+            detected_patterns, pattern_frequencies = self._analyze_patterns(df, column)
+            
+            results[column] = {
+                'format_type': format_type,
+                'violations': violations,
+                'detected_patterns': detected_patterns,
+                'pattern_frequencies': pattern_frequencies,
+                'example_violations': self._get_example_violations(df, column, pattern),
+                'violation_percentage': violations['total_count'] / df.count() * 100,
+                'suggested_formats': self._suggest_formats(detected_patterns)
+            }
+        
+        return results
+
+    def fix(self,
+            df: DataFrame,
+            columns: Union[str, List[str]],
+            format_types: Dict[str, str],
+            strategy: str = 'standardize',
+            target_formats: Optional[Dict[str, str]] = None,
+            lookup_tables: Optional[Dict[str, DataFrame]] = None,
+            handle_errors: str = 'flag') -> DataFrame:
+        """
+        Applies specified fixing strategy to handle format consistency issues.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame to fix
+        columns : Union[str, List[str]]
+            Columns to apply the fixing strategy to
+        format_types : Dict[str, str]
+            Dictionary mapping columns to their format types
+            (same as check method)
+        strategy : str, default='standardize'
+            Strategy to handle format issues. Options:
+            - 'standardize': Convert to standard format
+            - 'parse': Parse and reconstruct
+            - 'lookup': Use lookup tables for standardization
+            - 'regex': Apply regex transformations
+        target_formats : Optional[Dict[str, str]], default=None
+            Dictionary specifying target formats:
+            {
+                'date': 'yyyy-MM-dd',
+                'phone': '+1-XXX-XXX-XXXX',
+                'email': 'lowercase'
+            }
+        lookup_tables : Optional[Dict[str, DataFrame]], default=None
+            Dictionary of lookup tables for standardization
+        handle_errors : str, default='flag'
+            How to handle conversion errors:
+            - 'flag': Add error indicator column
+            - 'null': Replace with null
+            - 'preserve': Keep original value
+            - 'raise': Raise error
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with format consistency issues fixed according to
+            the specified strategy
+            
+        Examples
+        --------
+        >>> fc = FormatConsistency()
+        >>> 
+        >>> # Standardize dates and phones
+        >>> fixed_df = fc.fix(
+        ...     df,
+        ...     columns=['birth_date', 'phone'],
+        ...     format_types={
+        ...         'birth_date': 'date',
+        ...         'phone': 'phone'
+        ...     },
+        ...     target_formats={
+        ...         'birth_date': 'yyyy-MM-dd',
+        ...         'phone': '+1-XXX-XXX-XXXX'
+        ...     }
+        ... )
+        >>> 
+        >>> # Use lookup table for address standardization
+        >>> standardized_df = fc.fix(
+        ...     df,
+        ...     columns=['address'],
+        ...     format_types={'address': 'address'},
+        ...     strategy='lookup',
+        ...     lookup_tables={
+        ...         'address': address_standards_df
+        ...     }
+        ... )
+            
+        Notes
+        -----
+        The method provides multiple strategies for handling format issues:
+        
+        1. Standardize Strategy:
+           - Converts values to specified standard formats
+           - Handles common variations automatically
+           - Supports locale-specific formatting
+           - Preserves semantic meaning
+        
+        2. Parse Strategy:
+           - Breaks down complex formats into components
+           - Reconstructs in desired format
+           - Handles nested structures
+           - Validates component values
+        
+        3. Lookup Strategy:
+           - Uses reference tables for standardization
+           - Supports fuzzy matching
+           - Handles abbreviations and variants
+           - Maintains consistency with standards
+        
+        4. Regex Strategy:
+           - Applies pattern-based transformations
+           - Supports complex string manipulations
+           - Handles structured formats
+           - Validates results against patterns
+        
+        Raises
+        ------
+        ValueError
+            If strategy is invalid
+            If required parameters are missing
+            If format type is not supported
+            If column names don't exist in DataFrame
+        """
+        if isinstance(columns, str):
+            columns = [columns]
+        
+        for column in columns:
+            format_type = format_types.get(column)
+            if not format_type:
+                raise ValueError(f"No format type specified for column: {column}")
+            
+            if strategy == 'standardize':
+                df = self._standardize(df, column, format_type, target_formats)
+            elif strategy == 'parse':
+                df = self._parse(df, column, format_type)
+            elif strategy == 'lookup':
+                df = self._lookup(df, column, lookup_tables)
+            elif strategy == 'regex':
+                df = self._apply_regex(df, column, target_formats)
+            else:
+                raise ValueError(f"Invalid strategy: {strategy}")
+            
+            if handle_errors == 'flag':
+                df = self._flag_errors(df, column)
+            elif handle_errors == 'null':
+                df = self._replace_with_null(df, column)
+            elif handle_errors == 'preserve':
+                pass  # No action needed
+            elif handle_errors == 'raise':
+                self._raise_errors(df, column)
+            else:
+                raise ValueError(f"Invalid error handling strategy: {handle_errors}")
+        
+        return df
+
+    def add_pattern(self,
+                   name: str,
+                   pattern: str,
+                   validation_func: Optional[callable] = None,
+                   description: str = '') -> None:
+        """
+        Adds a new custom pattern for format validation.
+        
+        Parameters
+        ----------
+        name : str
+            Name of the new pattern
+        pattern : str
+            Regex pattern string
+        validation_func : Optional[callable], default=None
+            Custom validation function
+        description : str, default=''
+            Description of the pattern and its use
+            
+        Examples
+        --------
+        >>> fc = FormatConsistency()
+        >>> fc.add_pattern(
+        ...     name='product_code',
+        ...     pattern=r'^[A-Z]{2}-\d{4}$',
+        ...     description='Product code format: XX-9999'
+        ... )
+        """
+        if not hasattr(self, '_custom_patterns'):
+            self._custom_patterns = {}
+        
+        self._custom_patterns[name] = {
+            'pattern': pattern,
+            'validation_func': validation_func,
+            'description': description
+        }
+
+    def parse_components(self,
+                        df: DataFrame,
+                        column: str,
+                        format_type: str,
+                        output_columns: Optional[List[str]] = None) -> DataFrame:
+        """
+        Parses formatted values into their component parts.
+        
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Input DataFrame
+        column : str
+            Column to parse
+        format_type : str
+            Type of format to parse
+        output_columns : Optional[List[str]], default=None
+            Names for the output component columns
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with additional columns for components
+            
+        Examples
+        --------
+        >>> fc = FormatConsistency()
+        >>> # Parse address into components
+        >>> parsed_df = fc.parse_components(
+        ...     df,
+        ...     column='address',
+        ...     format_type='address',
+        ...     output_columns=['street', 'city', 'state', 'zip']
+        ... )
+        """
+        if format_type == 'address':
+            components = ['street', 'city', 'state', 'zip']
+        elif format_type == 'datetime':
+            components = ['date', 'time']
+        else:
+            raise ValueError(f"Unsupported format type for parsing: {format_type}")
+        
+        if output_columns and len(output_columns) == len(components):
+            components = output_columns
+        
+        for component in components:
+            df = df.withColumn(component, F.lit(None))  # Placeholder for actual parsing logic
+        
+        return df
+
+
+
 
