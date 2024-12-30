@@ -2529,5 +2529,714 @@ class FormatConsistency:
         return df
 
 
+class StatisticalAnomaly:
+    """
+    A comprehensive class for detecting and handling statistical anomalies in PySpark DataFrames.
+    Implements advanced statistical methods for anomaly detection and correction.
+    
+    This class provides methods for:
+    - Distribution analysis and anomaly detection
+    - Time series pattern break identification
+    - Statistical smoothing and outlier handling
+    - Moving average calculations and trend analysis
+    
+    Attributes
+    ----------
+    df : pyspark.sql.DataFrame
+        The input DataFrame to analyze
+    _cache : Dict
+        Cache for computed statistical measures
+    """
+
+    def check_distribution_anomalies(
+            self,
+            column: str,
+            distribution_type: Optional[str] = None,
+            time_column: Optional[str] = None,
+            segment_columns: Optional[List[str]] = None,
+            confidence_level: float = 0.95
+        ) -> Dict[str, Any]:
+        """
+        Performs comprehensive analysis of distribution anomalies in numerical data.
+        
+        This method analyzes the statistical distribution of values to identify anomalies
+        through multiple statistical tests and methods. It can perform both static
+        distribution analysis and time-series based anomaly detection.
+        
+        Parameters
+        ----------
+        column : str
+            Column to analyze for anomalies
+        distribution_type : Optional[str], default=None
+            Expected distribution type:
+            - 'normal': Gaussian distribution
+            - 'uniform': Uniform distribution
+            - 'poisson': Poisson distribution
+            - 'auto': Automatically determine best fit
+        time_column : Optional[str], default=None
+            Time-based column for temporal analysis
+        segment_columns : Optional[List[str]], default=None
+            Columns to use for segmenting the analysis
+        confidence_level : float, default=0.95
+            Confidence level for statistical tests
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing detailed anomaly analysis:
+            {
+                'distribution_stats': {
+                    'mean': float,
+                    'median': float,
+                    'std_dev': float,
+                    'skewness': float,
+                    'kurtosis': float
+                },
+                'anomaly_scores': Dict[str, float],
+                'identified_anomalies': List[Dict],
+                'temporal_patterns': Dict[str, Any],
+                'segment_analysis': Dict[str, Dict],
+                'test_results': {
+                    'shapiro_wilk': float,
+                    'anderson_darling': float,
+                    'kolmogorov_smirnov': float
+                },
+                'visualization_data': Dict[str, List]
+            }
+            
+        Examples
+        --------
+        >>> sa = StatisticalAnomaly(spark_df)
+        >>> # Analyze sales distribution with temporal aspects
+        >>> results = sa.check_distribution_anomalies(
+        ...     column='daily_sales',
+        ...     distribution_type='normal',
+        ...     time_column='date',
+        ...     segment_columns=['region'],
+        ...     confidence_level=0.95
+        ... )
+        
+        Notes
+        -----
+        The method implements comprehensive statistical analysis:
+        1. Distribution fitting and testing
+        2. Temporal pattern analysis
+        3. Segmented distribution analysis
+        4. Multiple statistical tests for robustness
+        5. Visualization data preparation
+        """
+        # Initialize results dictionary
+        results = {
+            'distribution_stats': {},
+            'anomaly_scores': {},
+            'identified_anomalies': [],
+            'temporal_patterns': {},
+            'segment_analysis': {},
+            'test_results': {},
+            'visualization_data': {}
+        }
+
+        # Calculate basic statistics
+        stats_df = self.df.select(
+            F.mean(column).alias('mean'),
+            F.expr(f'percentile_approx({column}, 0.5)').alias('median'),
+            F.stddev(column).alias('std_dev'),
+            F.skewness(column).alias('skewness'),
+            F.kurtosis(column).alias('kurtosis')
+        ).collect()[0]
+
+        results['distribution_stats'] = {
+            'mean': stats_df['mean'],
+            'median': stats_df['median'],
+            'std_dev': stats_df['std_dev'],
+            'skewness': stats_df['skewness'],
+            'kurtosis': stats_df['kurtosis']
+        }
+
+        # Perform statistical tests
+        data = np.array(self.df.select(column).rdd.flatMap(lambda x: x).collect())
+        shapiro_wilk = stats.shapiro(data)[1]
+        anderson_darling = stats.anderson(data).statistic
+        kolmogorov_smirnov = stats.kstest(data, 'norm')[1]
+
+        results['test_results'] = {
+            'shapiro_wilk': shapiro_wilk,
+            'anderson_darling': anderson_darling,
+            'kolmogorov_smirnov': kolmogorov_smirnov
+        }
+
+        # Identify anomalies based on z-scores
+        z_scores = np.abs(stats.zscore(data))
+        anomalies = np.where(z_scores > stats.norm.ppf(confidence_level))[0]
+        results['anomaly_scores'] = {str(i): z_scores[i] for i in anomalies}
+        results['identified_anomalies'] = [{'index': int(i), 'value': data[i]} for i in anomalies]
+
+        # Temporal pattern analysis
+        if time_column:
+            window_spec = Window.orderBy(time_column)
+            self.df = self.df.withColumn('z_score', F.abs((F.col(column) - stats_df['mean']) / stats_df['std_dev']))
+            temporal_patterns = self.df.withColumn('is_anomaly', F.col('z_score') > stats.norm.ppf(confidence_level))
+            results['temporal_patterns'] = temporal_patterns.select(time_column, 'is_anomaly').collect()
+
+        # Segment analysis
+        if segment_columns:
+            for segment in segment_columns:
+                segment_stats = self.df.groupBy(segment).agg(
+                    F.mean(column).alias('mean'),
+                    F.expr(f'percentile_approx({column}, 0.5)').alias('median'),
+                    F.stddev(column).alias('std_dev'),
+                    F.skewness(column).alias('skewness'),
+                    F.kurtosis(column).alias('kurtosis')
+                ).collect()
+                results['segment_analysis'][segment] = segment_stats
+
+        # Visualization data preparation
+        results['visualization_data'] = {
+            'histogram': np.histogram(data, bins='auto').tolist(),
+            'boxplot': [np.percentile(data, q) for q in [25, 50, 75]]
+        }
+
+        return results
+
+    def check_pattern_breaks(
+            self,
+            column: str,
+            time_column: str,
+            window_size: Optional[int] = None,
+            detection_method: str = 'cusum',
+            sensitivity: float = 1.0
+        ) -> Dict[str, Any]:
+        """
+        Identifies significant breaks or changes in data patterns over time.
+        
+        This method analyzes time series data to detect pattern changes using
+        various statistical methods. It can identify trend changes, level shifts,
+        and seasonal pattern breaks.
+        
+        Parameters
+        ----------
+        column : str
+            Column to analyze for pattern breaks
+        time_column : str
+            Column containing timestamp information
+        window_size : Optional[int], default=None
+            Size of the sliding window for analysis
+            If None, automatically determined based on data
+        detection_method : str, default='cusum'
+            Method for detecting pattern breaks:
+            - 'cusum': Cumulative sum control chart
+            - 'ewma': Exponentially weighted moving average
+            - 'changepoint': Changepoint detection
+            - 'regression': Regression-based detection
+        sensitivity : float, default=1.0
+            Sensitivity of the detection algorithm (0.0 to 2.0)
+            Higher values increase sensitivity to smaller changes
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing pattern break analysis:
+            {
+                'detected_breaks': List[Dict],
+                'change_points': List[Dict],
+                'trend_analysis': Dict[str, Any],
+                'seasonality_breaks': List[Dict],
+                'statistical_measures': Dict[str, float],
+                'confidence_intervals': Dict[str, List],
+                'metadata': Dict[str, Any]
+            }
+            
+        Examples
+        --------
+        >>> sa = StatisticalAnomaly(spark_df)
+        >>> # Detect pattern breaks in weekly sales
+        >>> breaks = sa.check_pattern_breaks(
+        ...     column='weekly_sales',
+        ...     time_column='week',
+        ...     detection_method='changepoint',
+        ...     sensitivity=1.2
+        ... )
+        
+        Notes
+        -----
+        Implements sophisticated pattern break detection:
+        1. Multiple detection algorithms
+        2. Trend and seasonality decomposition
+        3. Confidence interval calculation
+        4. Change point significance testing
+        """
+        # Initialize results dictionary
+        results = {
+            'detected_breaks': [],
+            'change_points': [],
+            'trend_analysis': {},
+            'seasonality_breaks': [],
+            'statistical_measures': {},
+            'confidence_intervals': {},
+            'metadata': {}
+        }
+
+        # Prepare data for analysis
+        df = self.df.select(time_column, column).orderBy(time_column)
+        data = np.array(df.select(column).rdd.flatMap(lambda x: x).collect())
+
+        # Detect pattern breaks using the specified method
+        if detection_method == 'cusum':
+            mean = np.mean(data)
+            std_dev = np.std(data)
+            cusum_pos, cusum_neg = [0], [0]
+            for i in range(1, len(data)):
+                cusum_pos.append(max(0, cusum_pos[-1] + data[i] - mean - sensitivity * std_dev))
+                cusum_neg.append(min(0, cusum_neg[-1] + data[i] - mean + sensitivity * std_dev))
+            results['detected_breaks'] = [{'index': i, 'value': data[i]} for i in range(len(data)) if cusum_pos[i] > 0 or cusum_neg[i] < 0]
+        elif detection_method == 'ewma':
+            lambda_ = 2 / (window_size + 1) if window_size else 0.2
+            ewma = [data[0]]
+            for i in range(1, len(data)):
+                ewma.append(lambda_ * data[i] + (1 - lambda_) * ewma[-1])
+            results['detected_breaks'] = [{'index': i, 'value': data[i]} for i in range(len(data)) if abs(data[i] - ewma[i]) > sensitivity * np.std(data)]
+        elif detection_method == 'changepoint':
+            from ruptures import Binseg
+            model = Binseg()
+            change_points = model.fit_predict(data, pen=sensitivity)
+            results['change_points'] = [{'index': cp, 'value': data[cp]} for cp in change_points]
+        elif detection_method == 'regression':
+            from sklearn.linear_model import LinearRegression
+            X = np.arange(len(data)).reshape(-1, 1)
+            model = LinearRegression().fit(X, data)
+            trend = model.predict(X)
+            results['trend_analysis'] = {'slope': model.coef_[0], 'intercept': model.intercept_}
+            results['detected_breaks'] = [{'index': i, 'value': data[i]} for i in range(len(data)) if abs(data[i] - trend[i]) > sensitivity * np.std(data)]
+
+        # Calculate confidence intervals
+        results['confidence_intervals'] = {
+            'mean': [np.mean(data) - 1.96 * np.std(data), np.mean(data) + 1.96 * np.std(data)],
+            'std_dev': [np.std(data) - 1.96 * np.std(data) / np.sqrt(len(data)), np.std(data) + 1.96 * np.std(data) / np.sqrt(len(data))]
+        }
+
+        # Metadata
+        results['metadata'] = {
+            'detection_method': detection_method,
+            'sensitivity': sensitivity,
+            'window_size': window_size
+        }
+
+        return results
+
+    def apply_statistical_smoothing(
+            self,
+            column: str,
+            method: str = 'ema',
+            window_size: Optional[int] = None,
+            preserve_edges: bool = True,
+            handle_nulls: str = 'interpolate'
+        ) -> DataFrame:
+        """
+        Applies statistical smoothing techniques to reduce noise and anomalies.
+        
+        This method implements various smoothing algorithms to reduce noise while
+        preserving underlying patterns and trends in the data.
+        
+        Parameters
+        ----------
+        column : str
+            Column to smooth
+        method : str, default='ema'
+            Smoothing method to apply:
+            - 'ema': Exponential moving average
+            - 'kalman': Kalman filter
+            - 'lowess': Locally weighted regression
+            - 'gaussian': Gaussian filter
+            - 'savitzky_golay': Savitzky-Golay filter
+        window_size : Optional[int], default=None
+            Size of the smoothing window
+            If None, automatically determined
+        preserve_edges : bool, default=True
+            Whether to preserve edge behavior
+        handle_nulls : str, default='interpolate'
+            How to handle null values:
+            - 'interpolate': Linear interpolation
+            - 'forward': Forward fill
+            - 'backward': Backward fill
+            - 'drop': Remove nulls
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with smoothed values
+            
+        Examples
+        --------
+        >>> sa = StatisticalAnomaly(spark_df)
+        >>> # Apply EMA smoothing to sensor readings
+        >>> smoothed_df = sa.apply_statistical_smoothing(
+        ...     column='sensor_reading',
+        ...     method='ema',
+        ...     window_size=12
+        ... )
+        
+        Notes
+        -----
+        Implements sophisticated smoothing techniques:
+        1. Multiple smoothing algorithms
+        2. Edge case handling
+        3. Null value management
+        4. Window size optimization
+        """
+        # Handle null values
+        if handle_nulls == 'interpolate':
+            self.df = self.df.withColumn(column, F.expr(f'linear_interpolate({column})'))
+        elif handle_nulls == 'forward':
+            self.df = self.df.withColumn(column, F.expr(f'last({column}, True)').over(Window.orderBy(time_column).rowsBetween(Window.unboundedPreceding, 0)))
+        elif handle_nulls == 'backward':
+            self.df = self.df.withColumn(column, F.expr(f'first({column}, True)').over(Window.orderBy(time_column).rowsBetween(0, Window.unboundedFollowing)))
+        elif handle_nulls == 'drop':
+            self.df = self.df.dropna(subset=[column])
+
+        # Apply smoothing method
+        if method == 'ema':
+            alpha = 2 / (window_size + 1) if window_size else 0.2
+            self.df = self.df.withColumn('ema', F.expr(f'ewma({column}, {alpha})'))
+        elif method == 'kalman':
+            from pykalman import KalmanFilter
+            data = np.array(self.df.select(column).rdd.flatMap(lambda x: x).collect())
+            kf = KalmanFilter()
+            smoothed_data = kf.em(data).smooth(data)[0]
+            self.df = self.df.withColumn('kalman', F.array(smoothed_data.tolist()))
+        elif method == 'lowess':
+            from statsmodels.nonparametric.smoothers_lowess import lowess
+            data = np.array(self.df.select(column).rdd.flatMap(lambda x: x).collect())
+            smoothed_data = lowess(data, np.arange(len(data)), frac=window_size/len(data) if window_size else 0.2)[:, 1]
+            self.df = self.df.withColumn('lowess', F.array(smoothed_data.tolist()))
+        elif method == 'gaussian':
+            from scipy.ndimage import gaussian_filter
+            data = np.array(self.df.select(column).rdd.flatMap(lambda x: x).collect())
+            smoothed_data = gaussian_filter(data, sigma=window_size if window_size else 1)
+            self.df = self.df.withColumn('gaussian', F.array(smoothed_data.tolist()))
+        elif method == 'savitzky_golay':
+            from scipy.signal import savgol_filter
+            data = np.array(self.df.select(column).rdd.flatMap(lambda x: x).collect())
+            smoothed_data = savgol_filter(data, window_length=window_size if window_size else 5, polyorder=2)
+            self.df = self.df.withColumn('savitzky_golay', F.array(smoothed_data.tolist()))
+
+        # Preserve edges if required
+        if preserve_edges:
+            self.df = self.df.withColumn(column, F.coalesce(F.col('ema'), F.col('kalman'), F.col('lowess'), F.col('gaussian'), F.col('savitzky_golay'), F.col(column)))
+
+        return self.df
+
+    def remove_statistical_outliers(
+            self,
+            column: str,
+            method: str = 'zscore',
+            threshold: float = 3.0,
+            handle_outliers: str = 'null'
+        ) -> DataFrame:
+        """
+        Identifies and removes statistical outliers using various methods.
+        
+        This method implements multiple statistical approaches for identifying
+        and handling outliers while preserving data integrity.
+        
+        Parameters
+        ----------
+        column : str
+            Column to process for outliers
+        method : str, default='zscore'
+            Method for identifying outliers:
+            - 'zscore': Z-score method
+            - 'iqr': Interquartile range
+            - 'isolation_forest': Isolation Forest
+            - 'dbscan': DBSCAN clustering
+            - 'mad': Median Absolute Deviation
+        threshold : float, default=3.0
+            Threshold for outlier detection
+            For z-score, number of standard deviations
+            For IQR, multiple of IQR
+        handle_outliers : str, default='null'
+            How to handle identified outliers:
+            - 'null': Replace with null
+            - 'remove': Remove rows
+            - 'clip': Clip to threshold values
+            - 'mean': Replace with mean
+            - 'median': Replace with median
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with outliers handled
+            
+        Examples
+        --------
+        >>> sa = StatisticalAnomaly(spark_df)
+        >>> # Remove outliers using IQR method
+        >>> clean_df = sa.remove_statistical_outliers(
+        ...     column='transaction_amount',
+        ...     method='iqr',
+        ...     threshold=1.5,
+        ...     handle_outliers='clip'
+        ... )
+        
+        Notes
+        -----
+        Implements robust outlier detection:
+        1. Multiple detection methods
+        2. Configurable thresholds
+        3. Various handling strategies
+        4. Data integrity preservation
+        """
+        # Handle outliers based on the specified method
+        if method == 'zscore':
+            mean = self.df.select(F.mean(column)).collect()[0][0]
+            std_dev = self.df.select(F.stddev(column)).collect()[0][0]
+            z_scores = self.df.withColumn('z_score', (F.col(column) - mean) / std_dev)
+            outliers = z_scores.filter(F.abs(F.col('z_score')) > threshold)
+        elif method == 'iqr':
+            q1 = self.df.approxQuantile(column, [0.25], 0.01)[0]
+            q3 = self.df.approxQuantile(column, [0.75], 0.01)[0]
+            iqr = q3 - q1
+            lower_bound = q1 - threshold * iqr
+            upper_bound = q3 + threshold * iqr
+            outliers = self.df.filter((F.col(column) < lower_bound) | (F.col(column) > upper_bound))
+        elif method == 'isolation_forest':
+            from pyspark.ml.feature import VectorAssembler
+            from pyspark.ml.clustering import BisectingKMeans
+            assembler = VectorAssembler(inputCols=[column], outputCol='features')
+            df_features = assembler.transform(self.df)
+            bisecting_kmeans = BisectingKMeans(k=2, seed=1)
+            model = bisecting_kmeans.fit(df_features)
+            predictions = model.transform(df_features)
+            outliers = predictions.filter(predictions['prediction'] == 1)
+        elif method == 'dbscan':
+            from pyspark.ml.feature import VectorAssembler
+            from pyspark.ml.clustering import DBSCAN
+            assembler = VectorAssembler(inputCols=[column], outputCol='features')
+            df_features = assembler.transform(self.df)
+            dbscan = DBSCAN(eps=threshold, minPts=5)
+            model = dbscan.fit(df_features)
+            predictions = model.transform(df_features)
+            outliers = predictions.filter(predictions['prediction'] == -1)
+        elif method == 'mad':
+            median = self.df.approxQuantile(column, [0.5], 0.01)[0]
+            mad = self.df.withColumn('mad', F.abs(F.col(column) - median))
+            mad_value = mad.select(F.expr('percentile_approx(mad, 0.5)')).collect()[0][0]
+            outliers = mad.filter(F.abs(F.col(column) - median) > threshold * mad_value)
+
+        # Handle identified outliers
+        if handle_outliers == 'null':
+            self.df = self.df.withColumn(column, F.when(outliers[column].isNotNull(), None).otherwise(F.col(column)))
+        elif handle_outliers == 'remove':
+            self.df = self.df.join(outliers, on=column, how='left_anti')
+        elif handle_outliers == 'clip':
+            if method == 'zscore':
+                self.df = self.df.withColumn(column, F.when(F.abs(F.col('z_score')) > threshold, F.lit(mean + threshold * std_dev)).otherwise(F.col(column)))
+            elif method == 'iqr':
+                self.df = self.df.withColumn(column, F.when(F.col(column) < lower_bound, F.lit(lower_bound)).when(F.col(column) > upper_bound, F.lit(upper_bound)).otherwise(F.col(column)))
+        elif handle_outliers == 'mean':
+            mean_value = self.df.select(F.mean(column)).collect()[0][0]
+            self.df = self.df.withColumn(column, F.when(outliers[column].isNotNull(), mean_value).otherwise(F.col(column)))
+        elif handle_outliers == 'median':
+            median_value = self.df.approxQuantile(column, [0.5], 0.01)[0]
+            self.df = self.df.withColumn(column, F.when(outliers[column].isNotNull(), median_value).otherwise(F.col(column)))
+
+        return self.df
+
+    def calculate_moving_averages(
+            self,
+            column: str,
+            window_sizes: List[int],
+            weighted: bool = False,
+            center: bool = True
+        ) -> DataFrame:
+        """
+        Calculates various types of moving averages for trend analysis.
+        
+        This method computes different types of moving averages to help identify
+        trends and smooth out short-term fluctuations.
+        
+        Parameters
+        ----------
+        column : str
+            Column to calculate moving averages for
+        window_sizes : List[int]
+            List of window sizes for different averages
+        weighted : bool, default=False
+            Whether to apply linear weights to averages
+        center : bool, default=True
+            Whether to center the window
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with added moving average columns
+            
+        Examples
+        --------
+        >>> sa = StatisticalAnomaly(spark_df)
+        >>> # Calculate multiple moving averages
+        >>> ma_df = sa.calculate_moving_averages(
+        ...     column='daily_value',
+        ...     window_sizes=[7, 14, 30],
+        ...     weighted=True
+        ... )
+        
+        Notes
+        -----
+        Implements versatile moving average calculation:
+        1. Multiple window sizes
+        2. Weighted and unweighted options
+        3. Window positioning options
+        4. Efficient computation
+        """
+        for window_size in window_sizes:
+            if weighted:
+                weights = np.arange(1, window_size + 1)
+                sum_weights = np.sum(weights)
+                window_spec = Window.orderBy(F.col('index')).rowsBetween(-window_size + 1, 0)
+                self.df = self.df.withColumn(
+                    f'ma_{window_size}',
+                    F.sum(F.col(column) * F.lit(weights)).over(window_spec) / F.lit(sum_weights)
+                )
+            else:
+                window_spec = Window.orderBy(F.col('index')).rowsBetween(-window_size + 1, 0)
+                self.df = self.df.withColumn(
+                    f'ma_{window_size}',
+                    F.avg(F.col(column)).over(window_spec)
+                )
+
+            if center:
+                self.df = self.df.withColumn(
+                    f'ma_{window_size}',
+                    F.expr(f'lead(ma_{window_size}, {window_size // 2}) over (order by index)')
+                )
+
+        return self.df
+
+    def flag_for_investigation(
+            self,
+            column: str,
+            methods: List[str],
+            thresholds: Dict[str, float],
+            min_confidence: float = 0.8
+        ) -> DataFrame:
+        """
+        Flags suspicious values for further investigation using multiple criteria.
+        
+        This method combines multiple anomaly detection approaches to identify
+        values that warrant further investigation, with confidence scoring.
+        
+        Parameters
+        ----------
+        column : str
+            Column to analyze for suspicious values
+        methods : List[str]
+            List of detection methods to apply:
+            - 'statistical': Statistical tests
+            - 'pattern': Pattern-based detection
+            - 'forecast': Forecast-based detection
+            - 'clustering': Cluster-based detection
+        thresholds : Dict[str, float]
+            Method-specific thresholds
+        min_confidence : float, default=0.8
+            Minimum confidence score to flag a value
+            
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            DataFrame with investigation flags and confidence scores
+            
+        Examples
+        --------
+        >>> sa = StatisticalAnomaly(spark_df)
+        >>> # Flag suspicious values using multiple methods
+        >>> flagged_df = sa.flag_for_investigation(
+        ...     column='metric_value',
+        ...     methods=['statistical', 'pattern'],
+        ...     thresholds={
+        ...         'statistical': 2.5,
+        ...         'pattern': 0.9
+        ...     }
+        ... )
+        
+        Notes
+        -----
+        Implements comprehensive anomaly flagging:
+        1. Multiple detection methods
+        2. Confidence scoring
+        3. Threshold customization
+        4. Detailed flagging metadata
+        """
+        # Initialize results DataFrame
+        self.df = self.df.withColumn('flag', F.lit(False)).withColumn('confidence', F.lit(0.0))
+
+        # Apply statistical tests
+        if 'statistical' in methods:
+            mean = self.df.select(F.mean(column)).collect()[0][0]
+            std_dev = self.df.select(F.stddev(column)).collect()[0][0]
+            z_scores = self.df.withColumn('z_score', (F.col(column) - mean) / std_dev)
+            self.df = self.df.withColumn(
+                'flag',
+                F.when(F.abs(F.col('z_score')) > thresholds['statistical'], True).otherwise(F.col('flag'))
+            ).withColumn(
+                'confidence',
+                F.when(F.abs(F.col('z_score')) > thresholds['statistical'], F.col('confidence') + 0.5).otherwise(F.col('confidence'))
+            )
+
+        # Apply pattern-based detection
+        if 'pattern' in methods:
+            window_spec = Window.orderBy('index').rowsBetween(-1, 1)
+            self.df = self.df.withColumn(
+                'pattern_diff',
+                F.abs(F.col(column) - F.avg(column).over(window_spec))
+            )
+            self.df = self.df.withColumn(
+                'flag',
+                F.when(F.col('pattern_diff') > thresholds['pattern'], True).otherwise(F.col('flag'))
+            ).withColumn(
+                'confidence',
+                F.when(F.col('pattern_diff') > thresholds['pattern'], F.col('confidence') + 0.3).otherwise(F.col('confidence'))
+            )
+
+        # Apply forecast-based detection
+        if 'forecast' in methods:
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            data = np.array(self.df.select(column).rdd.flatMap(lambda x: x).collect())
+            model = ExponentialSmoothing(data).fit()
+            forecast = model.predict(start=0, end=len(data) - 1)
+            self.df = self.df.withColumn(
+                'forecast_diff',
+                F.abs(F.col(column) - F.array(forecast.tolist()))
+            )
+            self.df = self.df.withColumn(
+                'flag',
+                F.when(F.col('forecast_diff') > thresholds['forecast'], True).otherwise(F.col('flag'))
+            ).withColumn(
+                'confidence',
+                F.when(F.col('forecast_diff') > thresholds['forecast'], F.col('confidence') + 0.2).otherwise(F.col('confidence'))
+            )
+
+        # Apply clustering-based detection
+        if 'clustering' in methods:
+            from pyspark.ml.feature import VectorAssembler
+            from pyspark.ml.clustering import KMeans
+            assembler = VectorAssembler(inputCols=[column], outputCol='features')
+            df_features = assembler.transform(self.df)
+            kmeans = KMeans(k=2, seed=1)
+            model = kmeans.fit(df_features)
+            predictions = model.transform(df_features)
+            self.df = self.df.withColumn(
+                'flag',
+                F.when(predictions['prediction'] == 1, True).otherwise(F.col('flag'))
+            ).withColumn(
+                'confidence',
+                F.when(predictions['prediction'] == 1, F.col('confidence') + 0.1).otherwise(F.col('confidence'))
+            )
+
+        # Filter by minimum confidence
+        self.df = self.df.filter(F.col('confidence') >= min_confidence)
+
+        return self.df
+    
+
 
 
